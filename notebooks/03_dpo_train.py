@@ -21,6 +21,7 @@
 
 # %%
 import os
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
 from pathlib import Path
 
 COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
@@ -79,6 +80,10 @@ assert torch.cuda.is_available(), "DPO needs a CUDA GPU. See HARDWARE-GUIDE.md."
 from unsloth import FastLanguageModel
 from peft import PeftModel
 
+# Force disable xFormers on T4 to avoid xformers GQA backward NotImplementedError
+if COMPUTE_TIER == "T4":
+    FastLanguageModel.disable_xFormers = True
+
 # Policy — gets new DPO LoRA adapter on top of SFT LoRA
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=BASE_MODEL,
@@ -88,6 +93,12 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 )
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+
+from unsloth import get_chat_template
+tokenizer = get_chat_template(
+    tokenizer,
+    chat_template="chatml",
+)
 
 # Load SFT adapter on top of base
 model = PeftModel.from_pretrained(model, str(SFT_PATH), is_trainable=True)
@@ -199,29 +210,75 @@ logs = logs[logs["loss"].notna() if "loss" in logs.columns else logs.index].copy
 chosen_col = "rewards/chosen" if "rewards/chosen" in logs.columns else None
 rejected_col = "rewards/rejected" if "rewards/rejected" in logs.columns else None
 
-fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+# ── Save raw reward history to CSV/JSON for reproducibility ──
+eval_dir = REPO_ROOT / "data" / "eval"
+eval_dir.mkdir(parents=True, exist_ok=True)
+
+reward_cols = ["step", "loss"]
+if chosen_col:
+    reward_cols.append(chosen_col)
+if rejected_col:
+    reward_cols.append(rejected_col)
+if "rewards/margins" in logs.columns:
+    reward_cols.append("rewards/margins")
+
+reward_history = logs[[c for c in reward_cols if c in logs.columns]].dropna(subset=["loss"]).copy()
+if chosen_col and rejected_col:
+    reward_history["reward_gap"] = reward_history[chosen_col] - reward_history[rejected_col]
+reward_history.to_csv(eval_dir / "dpo_reward_history.csv", index=False)
+reward_history.to_json(eval_dir / "dpo_reward_history.json", orient="records", indent=2)
+print(f"Saved raw reward history ({len(reward_history)} rows) to data/eval/dpo_reward_history.csv")
+print(f"Saved raw reward history ({len(reward_history)} rows) to data/eval/dpo_reward_history.json")
+
+# ── Plot 3 curves: chosen reward, rejected reward, reward gap ──
+fig, axes = plt.subplots(1, 3, figsize=(17, 4.2))
 
 if chosen_col and rejected_col:
-    axes[0].plot(logs["step"], logs[chosen_col], label="chosen reward", color="#2e548a", linewidth=1.5)
-    axes[0].plot(logs["step"], logs[rejected_col], label="rejected reward", color="#c83538", linewidth=1.5)
+    steps = logs["step"].values
+    chosen_vals = logs[chosen_col].values
+    rejected_vals = logs[rejected_col].values
+    gap_vals = chosen_vals - rejected_vals
+
+    # Smoothing helper (simple rolling mean, window=5)
+    def smooth(arr, w=5):
+        if len(arr) < w:
+            return arr
+        kernel = pd.Series(arr).rolling(w, min_periods=1, center=True).mean().values
+        return kernel
+
+    # Panel 1: Chosen reward
+    axes[0].plot(steps, chosen_vals, alpha=0.35, color="#2e548a", linewidth=0.8, label="raw")
+    axes[0].plot(steps, smooth(chosen_vals), color="#2e548a", linewidth=2.0, label="smoothed")
     axes[0].axhline(0, color="#888", linestyle=":", linewidth=0.7)
     axes[0].set_xlabel("Training step")
     axes[0].set_ylabel("Implicit reward (log π/π_ref)")
-    axes[0].set_title("Chosen vs Rejected rewards")
-    axes[0].legend()
+    axes[0].set_title("Chosen reward")
+    axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
-    gap = logs[chosen_col] - logs[rejected_col]
-    axes[1].plot(logs["step"], gap, color="#1a3355", linewidth=1.8)
+    # Panel 2: Rejected reward
+    axes[1].plot(steps, rejected_vals, alpha=0.35, color="#c83538", linewidth=0.8, label="raw")
+    axes[1].plot(steps, smooth(rejected_vals), color="#c83538", linewidth=2.0, label="smoothed")
     axes[1].axhline(0, color="#888", linestyle=":", linewidth=0.7)
     axes[1].set_xlabel("Training step")
-    axes[1].set_ylabel("Reward gap (chosen − rejected)")
-    axes[1].set_title("Reward gap (the headline number)")
+    axes[1].set_ylabel("Implicit reward (log π/π_ref)")
+    axes[1].set_title("Rejected reward")
+    axes[1].legend(fontsize=8)
     axes[1].grid(True, alpha=0.3)
+
+    # Panel 3: Reward gap (chosen − rejected)
+    axes[2].plot(steps, gap_vals, alpha=0.35, color="#1a3355", linewidth=0.8, label="raw")
+    axes[2].plot(steps, smooth(gap_vals), color="#1a3355", linewidth=2.0, label="smoothed")
+    axes[2].axhline(0, color="#888", linestyle=":", linewidth=0.7)
+    axes[2].set_xlabel("Training step")
+    axes[2].set_ylabel("Reward gap (chosen − rejected)")
+    axes[2].set_title("Reward gap (the headline number)")
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
 else:
-    axes[0].text(0.5, 0.5, "No reward columns in trainer.state.log_history.\nLikely TRL version mismatch.",
-                 ha="center", va="center", transform=axes[0].transAxes)
-    axes[1].text(0.5, 0.5, "—", ha="center", va="center", transform=axes[1].transAxes)
+    for ax in axes:
+        ax.text(0.5, 0.5, "No reward columns in trainer.state.log_history.\nLikely TRL version mismatch.",
+                ha="center", va="center", transform=ax.transAxes)
 
 fig.suptitle(f"DPO reward curves · {COMPUTE_TIER} · β={BETA} · lr={LR}", y=1.02)
 fig.tight_layout()
@@ -275,6 +332,9 @@ print(f"Saved DPO adapter to {DPO_OUT}")
 # Save the headline metrics for verify.py + REFLECTION
 import json
 
+# Verify DPO adapter is distinct from SFT adapter
+assert str(DPO_OUT) != str(SFT_PATH), "DPO adapter must save to a different directory than SFT!"
+
 metrics = {
     "compute_tier": COMPUTE_TIER,
     "base_model": BASE_MODEL,
@@ -285,9 +345,33 @@ metrics = {
     "end_chosen_reward": float(last_chosen) if chosen_col else None,
     "end_rejected_reward": float(last_rejected) if rejected_col else None,
     "end_reward_gap": float(last_gap) if chosen_col and rejected_col else None,
+    "chosen_delta": float(chosen_delta) if chosen_col else None,
+    "failure_mode": (
+        "likelihood_displacement" if chosen_col and chosen_delta < -0.5 and last_gap > 0
+        else "classic_success" if chosen_col and chosen_delta > 0 and last_gap > 0
+        else "negative_gap" if chosen_col and last_gap < 0
+        else "ambiguous" if chosen_col
+        else "unknown"
+    ),
 }
 (DPO_OUT / "dpo_metrics.json").write_text(json.dumps(metrics, indent=2))
 print(f"Wrote metrics to {DPO_OUT / 'dpo_metrics.json'}")
+print(f"Failure mode detected: {metrics['failure_mode']}")
+
+# Push DPO adapter to HuggingFace Hub
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=REPO_ROOT / ".env")
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        print("Uploading DPO adapter to HuggingFace Hub...")
+        trainer.model.push_to_hub("AnhNQ-2A202600608/2A202600608-Nguyen-Quang-Anh-Day22-DPO", token=hf_token)
+        tokenizer.push_to_hub("AnhNQ-2A202600608/2A202600608-Nguyen-Quang-Anh-Day22-DPO", token=hf_token)
+        print("✓ Successfully pushed DPO adapter to HuggingFace Hub!")
+    else:
+        print("WARN: HF_TOKEN not found in environment. Skipping HuggingFace upload.")
+except Exception as e:
+    print(f"WARN: Failed to push DPO adapter to HuggingFace Hub: {e}")
 
 # %% [markdown]
 # ## 7. Vibe-coding callout

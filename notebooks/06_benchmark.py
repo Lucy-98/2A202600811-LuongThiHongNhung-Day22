@@ -27,6 +27,7 @@
 
 # %%
 import os
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
 import json
 import gc
 from pathlib import Path
@@ -81,7 +82,7 @@ def run_lm_eval(adapter_path, tasks, limit, num_fewshot, label):
     cmd = [
         "lm_eval",
         "--model", "hf",
-        "--model_args", f"pretrained={base},peft={adapter_path},load_in_4bit=True",
+        "--model_args", f"pretrained={base},peft={adapter_path}",
         "--tasks", tasks,
         "--num_fewshot", str(num_fewshot),
         "--limit", str(limit),
@@ -96,6 +97,8 @@ def run_lm_eval(adapter_path, tasks, limit, num_fewshot, label):
     if not out_files:
         print("WARN: lm-eval didn't write results JSON. STDOUT tail:")
         print(proc.stdout[-1000:])
+        print("STDERR tail:")
+        print(proc.stderr[-2000:])
         return {"error": "no_results"}
     return json.loads(out_files[-1].read_text())["results"]
 
@@ -196,6 +199,12 @@ def generate_with_adapter(adapter_path, prompts, max_new_tokens=256):
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    from unsloth import get_chat_template
+    tokenizer = get_chat_template(
+        tokenizer,
+        chat_template="chatml",
+    )
     model = PeftModel.from_pretrained(model, str(adapter_path))
     FastLanguageModel.for_inference(model)
 

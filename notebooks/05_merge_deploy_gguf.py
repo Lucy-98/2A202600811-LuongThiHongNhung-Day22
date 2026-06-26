@@ -23,6 +23,7 @@
 
 # %%
 import os
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
 import json
 from pathlib import Path
 
@@ -58,66 +59,66 @@ assert torch.cuda.is_available()
 # %%
 from unsloth import FastLanguageModel
 from peft import PeftModel
+import json
+import gc
 
+# STEP 1: Load SFT model and DPO model sequential merge using unquantized base model
+UNQUANTIZED_MAP = {
+    "unsloth/Qwen2.5-3B-bnb-4bit": "Qwen/Qwen2.5-3B",
+    "unsloth/Qwen2.5-7B-bnb-4bit": "Qwen/Qwen2.5-7B",
+}
+UNQUANTIZED_MODEL = UNQUANTIZED_MAP.get(BASE_MODEL, "Qwen/Qwen2.5-3B")
+
+print(f"Loading unquantized base model: {UNQUANTIZED_MODEL} in FP16...")
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL,
+    model_name=UNQUANTIZED_MODEL,
     max_seq_length=MAX_LEN,
     dtype=None,
-    load_in_4bit=True,
+    load_in_4bit=False,
 )
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
 
-# Stack SFT-mini → DPO adapters
+# Apply ChatML template to tokenizer
+from unsloth import get_chat_template
+tokenizer = get_chat_template(
+    tokenizer,
+    chat_template="chatml",
+)
+
+# Load SFT adapter
 SFT_PATH = REPO_ROOT / "adapters" / "sft-mini"
 model = PeftModel.from_pretrained(model, str(SFT_PATH))
 print(f"Loaded SFT-mini adapter from {SFT_PATH}")
 
-# %% [markdown]
-# > **Note:** The DPO adapter trained in NB3 stacks on top of SFT. To get a fully
-# > aligned merged model, we apply both adapters before merging. Unsloth's
-# > `save_pretrained_merged` handles the SFT + DPO + base merge in one shot.
+# Merge SFT weights
+model = model.merge_and_unload()
+print("Merged SFT-mini adapter weights.")
 
-# %% [markdown]
-# ## 2. Save merged FP16 weights
-#
-# `save_pretrained_merged(method="merged_16bit")` produces a HuggingFace-format
-# directory you can either upload to HF Hub directly OR feed into the GGUF
-# converter in step 3.
+# Load DPO adapter
+model = PeftModel.from_pretrained(model, str(DPO_PATH))
+print(f"Loaded DPO adapter from {DPO_PATH}")
 
-# %%
-# This re-loads the model with both SFT and DPO adapters merged into base weights.
-# Output is FP16 (or BF16 on Ampere+) HF-format weights ready for inference.
-model.save_pretrained_merged(
-    str(MERGED_PATH),
-    tokenizer,
-    save_method="merged_16bit",
-)
-print(f"Saved merged FP16 to {MERGED_PATH}")
+# Merge DPO weights
+model = model.merge_and_unload()
+print("Merged DPO adapter weights.")
 
-# Free GPU memory before GGUF conversion (which spawns a subprocess that needs RAM)
-import gc
+# Save final merged model in standard HF FP16 format
+model.save_pretrained(str(MERGED_PATH))
+tokenizer.save_pretrained(str(MERGED_PATH))
+print(f"Saved final SFT+DPO merged model (FP16) to {MERGED_PATH}")
 
+# Free VRAM memory
 del model
 gc.collect()
 torch.cuda.empty_cache()
 
-# %% [markdown]
-# ## 3. Quantize to GGUF Q4_K_M
-#
-# Q4_K_M is the sweet spot: ~4× compression vs FP16, minimal quality loss.
-# Unsloth wraps llama.cpp's `quantize` binary — first run downloads + compiles
-# llama.cpp (~3 min) then quantizes (~30 s).
-
-# %%
-# Reload the merged model — Unsloth's GGUF saver expects a live model handle.
+# STEP 3: Reload the final merged model for GGUF quantization
 from unsloth import FastLanguageModel as FLM
 
 model, tokenizer = FLM.from_pretrained(
     model_name=str(MERGED_PATH),
     max_seq_length=MAX_LEN,
     dtype=None,
-    load_in_4bit=False,    # already merged; load full precision
+    load_in_4bit=False,
 )
 
 # %%
@@ -129,6 +130,14 @@ model.save_pretrained_gguf(
     quantization_method="q4_k_m",
 )
 print(f"Saved GGUF Q4_K_M to {GGUF_DIR}")
+
+# Move file to GGUF_DIR if it was saved in the local model_gguf path due to Unsloth quirk
+expected_path = MERGED_PATH.parent / f"{MERGED_PATH.name}_gguf"
+if expected_path.exists():
+    import shutil
+    for f in expected_path.glob("*.gguf"):
+        shutil.move(str(f), str(GGUF_DIR / f.name))
+    print(f"Moved GGUF files to {GGUF_DIR}")
 
 # %% [markdown]
 # ### 3a. Optional — additional quantization tiers (for the +3 rigor add-on)
@@ -240,6 +249,35 @@ deploy_meta = {
     json.dumps(deploy_meta, ensure_ascii=False, indent=2)
 )
 print("Saved data/eval/deploy_meta.json")
+
+# Push GGUF file to HuggingFace Hub
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=REPO_ROOT / ".env")
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        print("Creating GGUF repository on HuggingFace Hub...")
+        api.create_repo(
+            repo_id="AnhNQ-2A202600608/2A202600608-Nguyen-Quang-Anh-Day22-GGUF",
+            repo_type="model",
+            exist_ok=True,
+            token=hf_token
+        )
+        print("Uploading GGUF model to HuggingFace Hub (this may take a few minutes)...")
+        api.upload_file(
+            path_or_fileobj=str(gguf_path),
+            path_in_repo=gguf_path.name,
+            repo_id="AnhNQ-2A202600608/2A202600608-Nguyen-Quang-Anh-Day22-GGUF",
+            repo_type="model",
+            token=hf_token
+        )
+        print("✓ Successfully pushed GGUF to HuggingFace Hub!")
+    else:
+        print("WARN: HF_TOKEN not found in environment. Skipping GGUF HuggingFace upload.")
+except Exception as e:
+    print(f"WARN: Failed to push GGUF to HuggingFace Hub: {e}")
 
 # %% [markdown]
 # ## 7. Submission checklist

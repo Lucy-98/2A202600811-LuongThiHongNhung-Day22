@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -53,11 +54,21 @@ def main():
     from trl import DPOConfig, DPOTrainer
     from unsloth import FastLanguageModel
 
+    # Force disable xFormers on T4 to avoid xformers GQA backward NotImplementedError
+    if tier == "T4":
+        FastLanguageModel.disable_xFormers = True
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=base_model, max_seq_length=max_len, dtype=None, load_in_4bit=True,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    from unsloth import get_chat_template
+    tokenizer = get_chat_template(
+        tokenizer,
+        chat_template="chatml",
+    )
 
     model = PeftModel.from_pretrained(model, args.sft_path, is_trainable=True)
     model = FastLanguageModel.get_peft_model(
@@ -99,12 +110,27 @@ def main():
     trainer.model.save_pretrained(str(output))
     tokenizer.save_pretrained(str(output))
 
-    # Headline metrics
+    # Headline metrics + full reward history
     import pandas as pd
 
     logs = pd.DataFrame(trainer.state.log_history)
     chosen_col = "rewards/chosen" if "rewards/chosen" in logs.columns else None
     rejected_col = "rewards/rejected" if "rewards/rejected" in logs.columns else None
+
+    # Save raw reward history to CSV
+    reward_cols = ["step", "loss"]
+    if chosen_col: reward_cols.append(chosen_col)
+    if rejected_col: reward_cols.append(rejected_col)
+    reward_history = logs[[c for c in reward_cols if c in logs.columns]].dropna(subset=["loss"]).copy()
+    if chosen_col and rejected_col:
+        reward_history["reward_gap"] = reward_history[chosen_col] - reward_history[rejected_col]
+    reward_history.to_csv(output / "reward_history.csv", index=False)
+
+    last_chosen = float(logs[chosen_col].iloc[-5:].mean()) if chosen_col else None
+    last_rejected = float(logs[rejected_col].iloc[-5:].mean()) if rejected_col else None
+    first_chosen = float(logs[chosen_col].iloc[:5].mean()) if chosen_col else None
+    chosen_delta = (last_chosen - first_chosen) if last_chosen is not None and first_chosen is not None else None
+    end_gap = (last_chosen - last_rejected) if last_chosen is not None and last_rejected is not None else None
 
     metrics = {
         "compute_tier": tier,
@@ -113,16 +139,24 @@ def main():
         "lr": args.lr,
         "epochs": args.epochs,
         "final_train_loss": float(train_result.training_loss),
-        "end_chosen_reward": float(logs[chosen_col].iloc[-5:].mean()) if chosen_col else None,
-        "end_rejected_reward": float(logs[rejected_col].iloc[-5:].mean()) if rejected_col else None,
+        "end_chosen_reward": last_chosen,
+        "end_rejected_reward": last_rejected,
+        "end_reward_gap": end_gap,
+        "chosen_delta": chosen_delta,
+        "failure_mode": (
+            "likelihood_displacement" if chosen_delta is not None and chosen_delta < -0.5 and end_gap is not None and end_gap > 0
+            else "classic_success" if chosen_delta is not None and chosen_delta > 0 and end_gap is not None and end_gap > 0
+            else "negative_gap" if end_gap is not None and end_gap < 0
+            else "ambiguous" if chosen_col
+            else "unknown"
+        ),
     }
-    if metrics["end_chosen_reward"] is not None and metrics["end_rejected_reward"] is not None:
-        metrics["end_reward_gap"] = metrics["end_chosen_reward"] - metrics["end_rejected_reward"]
 
     (output / "dpo_metrics.json").write_text(json.dumps(metrics, indent=2))
     print(f"\nFinal loss:     {train_result.training_loss:.4f}")
-    if "end_reward_gap" in metrics:
-        print(f"End reward gap: {metrics['end_reward_gap']:+.3f}")
+    if end_gap is not None:
+        print(f"End reward gap: {end_gap:+.3f}")
+    print(f"Failure mode:   {metrics['failure_mode']}")
     print(f"Saved to {output}")
 
 

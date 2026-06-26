@@ -1,0 +1,10 @@
+{
+  "compute_tier": "T4",
+  "base_model": "unsloth/Qwen2.5-3B-bnb-4bit",
+  "merged_path": "/content/2A202600608-Nguyen-Quang-Anh-Day22/adapters/merged-fp16",
+  "gguf_path": "/content/2A202600608-Nguyen-Quang-Anh-Day22/gguf/merged-fp16.Q4_K_M.gguf",
+  "gguf_size_mb": 1929.9,
+  "quantization": "q4_k_m",
+  "smoke_prompt": "Giải thích ngắn gọn (3 câu) cách thuật toán Bubble sort hoạt động.",
+  "smoke_response": "Bubble sort là thuật toán sắp xếp phổ biến được sử dụng để sắp xếp các phần tử trong một mảng. Nó hoạt động bằng cách lặp lại quá trình so sánh hai phần tử liên tiếp trong mảng và sắp xếp chúng nếu cần. Quá trình này được gọi là một vòng lặp và được thực hiện cho đến khi không còn có hai phần tử nào cần sắp xếp. Sau mỗi vòng lặp, phần tử lớn nhất trong mảng sẽ được đưa đến cuối mảng. Quá trình này tiếp tục cho đến khi mảng được sắp xếp."
+}
